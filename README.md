@@ -89,12 +89,15 @@ conncetion are shown in .ino file
 
 6. **Copy the min and max values** from the Python scaler and use them in the Arduino sketch  
    to scale sensor data in the same range as used for training.
+   
+8. **Place** the `weather_model.h` file and the min/max arrays into the Arduino project folder you want to use.
 
-7. **Place** the `weather_model.h` file and the min/max arrays into the Arduino project folder you want to use.
+   **It’s best to export the compiled binary** (Sketch → Export Compiled Binary)  
+   **so it doesn't compile every time. Note: compilation may take some time.**
 
-8. **(Optional)** Test the model with model_test.ino in a controlled environment and verify your preprocessing steps.
+9. **(Optional)** Test the model with model_test.ino in a controlled environment and verify your preprocessing steps.
 
-9. **Upload** `weather_predict.ino` to your Arduino for real-time predictions.
+10. **Upload** `weather_predict.ino` to your Arduino for real-time predictions.
 
 
 ---
