@@ -1,176 +1,142 @@
-#include <Arduino.h>
-#include <Arduino_LPS22HB.h>      // Barometer/Temperature sensor
-#include "dht.h"                   // DHT11 library
-#include "weather_model.h"         // TensorFlow Lite model
-// TensorFlow Lite Micro headers
-#include "TensorFlowLite.h"
-#include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/micro_error_reporter.h"
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
-#include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/version.h"
+// ------------------------- Hardware headers ------------------------------------------------------------------------------------------------
+#include <Arduino.h>                                         // Core Arduino functions (Serial, pinMode, digitalWrite, etc.)
+#include <Arduino_LPS22HB.h>                                 // Library for LPS22HB Barometer/Temperature sensor
+#include "dht.h"                                             // Library for DHT11 humidity/temperature sensor
+#include "weather_model.h"                                   // TensorFlow Lite model header (.h file generated from .tflite)
+// ------------------------- TensorFlow Lite Micro headers -----------------------------------------------------------------------------------
+#include "TensorFlowLite.h"                                  // Core TFLite Micro definitions
+#include "tensorflow/lite/micro/micro_interpreter.h"         // Interpreter to run TFLite Micro models
+#include "tensorflow/lite/micro/micro_error_reporter.h"      // For reporting errors from TFLite Micro
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h" // Registers operations for the model
+#include "tensorflow/lite/schema/schema_generated.h"         // TFLite model schema (generated from .tflite file)
+#include "tensorflow/lite/version.h"                         // TensorFlow Lite version info
 
+// ------------------------- Sensor & Pin Definitions ----------------------------------------------------------------------------------------
+#define dht_apin A6                                         // Analog pin connected to DHT11 data line
+dht DHT;                                                    // Instantiate DHT11 object
+#define averageOver 5                                       // Number of readings to average for smoother sensor output
+#define DHTTYPE DHT11                                       // DHT sensor type (DHT11)
 
-#define dht_apin A6                // Analog pin for DHT11
-dht DHT;
-#define averageOver 5              // Average over 5 readings
-#define DHTPIN 2
-#define DHTTYPE DHT11
-float pressure, temperature, humidity;
+// ------------------------- Global Variables ------------------------------------------------------------------------------------------------
+float pressure, temperature, humidity;                     // Variables to store raw sensor readings
+float minVals[3] = {96.18, 28.72, 55.4};                   // Minimum expected values for Pressure, Temperature, Humidity
+float maxVals[3] = {97.11, 36.03, 144.8};                  // Maximum expected values for Pressure, Temperature, Humidity
+float p_pred, t_pred, h_pred;                              // Variables to store predicted sensor readings
 
-// Error reporter
-tflite::ErrorReporter* error_reporter = nullptr;
-tflite::MicroErrorReporter micro_error_reporter;
+// ------------------------- TensorFlow Lite Error Handling ----------------------------------------------------------------------------------
+tflite::ErrorReporter* error_reporter = nullptr;           // Pointer for error reporting
+tflite::MicroErrorReporter micro_error_reporter;           // TFLite Micro error reporter instance
 
-// TFLM objects
-const tflite::Model* model = nullptr;
-tflite::MicroInterpreter* interpreter = nullptr;
-tflite::MicroMutableOpResolver<5> resolver;
+// ------------------------- TensorFlow Lite Interpreter -------------------------------------------------------------------------------------
+const tflite::Model* model = nullptr;                      // Pointer to TFLite model, assigned in setup
+tflite::MicroInterpreter* interpreter = nullptr;           // Pointer to TFLite Micro interpreter
+tflite::MicroMutableOpResolver<5> resolver;                // Resolver to register up to 5 operations (FullyConnected, ReLU, etc.)
 
-constexpr int kTensorArenaSize = 20 * 1024;
-static uint8_t tensor_arena[kTensorArenaSize];
+// ------------------------- Tensor Arena ---------------------------------------------------------------------------------------------------
+constexpr int kTensorArenaSize = 20 * 1024;                // 20 KB arena for tensor computations (RAM reserved for model)
+static uint8_t tensor_arena[kTensorArenaSize];             // Memory buffer used by TFLite Micro for tensors
 
-TfLiteTensor* input;
-TfLiteTensor* output;
+TfLiteTensor* input;                                       // Pointer to input tensor of the model
+TfLiteTensor* output;                                      // Pointer to output tensor of the model
 
-// Min/max arrays for easy indexing
-float minVals[3] = {96.18, 28.72, 55.4};
-float maxVals[3] = {97.11, 36.03, 144.8};
-
-// Raw window array (12 readings × 3 features)
-
-    float p_pred;
-    float t_pred;
-    float h_pred;
-
+// ------------------------- Functions ------------------------------------------------------------------------------------------------------
 float processValue(float val, int n) 
 {
-  // Clamp
+  // Clamp value between min and max
   if(val < minVals[n]) val = minVals[n];
   if(val > maxVals[n]) val = maxVals[n];
   
-  // Scale to 0-1
+  // Scale value to range 0-1
   return (val - minVals[n]) / (maxVals[n] - minVals[n]);
 }
-void readValues() 
-{
-    pressure = 0;
-    temperature = 0;
-    humidity = 0;
-    for(int count = 0; count < averageOver; count++) 
-    {
-      pressure    += BARO.readPressure();
-      temperature += BARO.readTemperature();
-      DHT.read11(dht_apin);
-      humidity    += DHT.humidity;
-      delay(2000); // wait between readings
-    }
-    pressure    /= averageOver;
-    temperature /= averageOver;
-    humidity    /= averageOver;
-}
-#include <iostream>
-using namespace std;
 
- 
+// ------------------------- Raw Input Data (example 24 readings) ----------------------------------------------------------------------------
 float raw_input[24][3] = {
-    {96.87f, 33.39f, 68.4f},
-    {96.87f, 33.41f, 68.0f},
-    {96.87f, 33.40f, 68.2f},
-    {96.87f, 33.45f, 68.4f},
-    {96.88f, 33.39f, 68.2f},
-    {96.87f, 33.43f, 68.2f},
-    {96.87f, 32.44f, 68.2f},
-    {96.87f, 32.00f, 68.8f},
-    {96.88f, 31.95f, 69.6f},
-    {96.89f, 31.91f, 69.8f},
-    {96.90f, 31.86f, 69.6f},
-    {96.91f, 31.88f, 69.2f},// 1hour
-    {96.92f, 31.82f, 70.0f},
-    {96.92f, 31.71f, 70.0f},
-    {96.92f, 31.63f, 70.6f},
-    {96.91f, 31.57f, 70.8f},
-    {96.89f, 31.45f, 71.0f},
-    {96.90f, 31.44f, 72.0f},
-    {96.90f, 31.40f, 72.0f},
-    {96.90f, 31.38f, 72.0f},
-    {96.88f, 31.28f, 72.2f},
-    {96.88f, 31.30f, 72.6f},
-    {96.88f, 31.23f, 73.0f},
-    {96.86f, 31.16f, 72.8f}
+    {96.87f, 33.39f, 68.4f}, {96.87f, 33.41f, 68.0f}, {96.87f, 33.40f, 68.2f},
+    {96.87f, 33.45f, 68.4f}, {96.88f, 33.39f, 68.2f}, {96.87f, 33.43f, 68.2f},
+    {96.87f, 32.44f, 68.2f}, {96.87f, 32.00f, 68.8f}, {96.88f, 31.95f, 69.6f},
+    {96.89f, 31.91f, 69.8f}, {96.90f, 31.86f, 69.6f}, {96.91f, 31.88f, 69.2f},
+    {96.92f, 31.82f, 70.0f}, {96.92f, 31.71f, 70.0f}, {96.92f, 31.63f, 70.6f},
+    {96.91f, 31.57f, 70.8f}, {96.89f, 31.61f, 71.0f}, {96.90f, 31.54f, 72.0f},
+    {96.90f, 31.59f, 72.0f}, {96.90f, 31.55f, 72.0f}, {96.88f, 31.58f, 72.2f},
+    {96.88f, 31.56f, 72.6f}, {96.88f, 31.51f, 73.0f}, {96.86f, 31.59f, 72.8f}
 };
 
+// ------------------------- Arduino Setup --------------------------------------------------------------------------------------------------
 void setup() {
-  Serial.begin(9600);
-  while (!Serial);
+  Serial.begin(9600);                   // Start serial communication
+  while (!Serial);                      // Wait for serial to be ready
 
-  // Initialize sensors
-  BARO.begin();
-  // Setup error reporter
-  error_reporter = &micro_error_reporter;
-  // Load model
+  BARO.begin();                         // Initialize barometer sensor
+  error_reporter = &micro_error_reporter; // Assign error reporter
+
+  // Load TFLite model from header
   const tflite::Model* model = tflite::GetModel(weather_model_tflite);
-  static tflite::MicroMutableOpResolver<5> resolver;
-  resolver.AddFullyConnected();
-  resolver.AddRelu();
-  //resolver.AddQuantize();
-  //resolver.AddDequantize();
 
+  // Setup operation resolver
+  static tflite::MicroMutableOpResolver<5> resolver;
+  resolver.AddFullyConnected();          // Register FullyConnected (Dense) layer
+  resolver.AddRelu();                    // Register ReLU activation
+
+  // Setup interpreter
   static tflite::MicroInterpreter static_interpreter(
     model, resolver,
     tensor_arena, kTensorArenaSize,
-    error_reporter, nullptr  // profiler is optional
-    );
+    error_reporter, nullptr            // Optional profiler not used
+  );
+  interpreter = &static_interpreter;     // Assign global interpreter pointer
 
-  interpreter = &static_interpreter;
-
+  // Allocate tensors
   if (interpreter->AllocateTensors() != kTfLiteOk) 
   {
     Serial.println("AllocateTensors() failed");
     while (1);
   }
 
-  input = interpreter->input(0);
-  output = interpreter->output(0);
+  input = interpreter->input(0);         // Get input tensor pointer
+  output = interpreter->output(0);       // Get output tensor pointer
 
   Serial.println("Model loaded!");
   Serial.println("Pressure, Temperature, Humidity");
 
-    for(int i=0;i<12;i++)// input loop
+  // ------------------------- Fill input tensor with first 12 raw readings ------------------------
+  for(int i=0; i<12; i++) 
   {
-    //read sensor values
-    pressure = raw_input[i][0];
-    temperature = raw_input[i][1];
-    humidity = raw_input[i][2];
+    pressure = raw_input[i][0];          // Get pressure
+    temperature = raw_input[i][1];       // Get temperature
+    humidity = raw_input[i][2];          // Get humidity
+
     Serial.print(", raw P: ");
     Serial.print(pressure, 2);
     Serial.print(", T: ");
     Serial.print(temperature, 2);
     Serial.print(", H: ");
     Serial.println(humidity, 2);
-    // processing the values
-    pressure=processValue(pressure,0);    
-    temperature=processValue(temperature,1);    
-    humidity=processValue(humidity,2); 
-    //giving input to model 
-    input->data.f[i*3+0] = pressure;
-    input->data.f[i*3+1] = temperature;
-    input->data.f[i*3+2] = humidity;
+
+    // Process and scale values
+    pressure    = processValue(pressure, 0);    
+    temperature = processValue(temperature, 1);    
+    humidity    = processValue(humidity, 2); 
+
+    // Assign to model input tensor
+    input->data.f[i*3 + 0] = pressure;
+    input->data.f[i*3 + 1] = temperature;
+    input->data.f[i*3 + 2] = humidity;
   }
-    // Invoke model
-  float lastScaled[3] = {input->data.f[33], input->data.f[34], input->data.f[35]};
+
+  // ------------------------- Invoke model and predict next 12 readings --------------------------------
+  float lastScaled[3] = {input->data.f[33], input->data.f[34], input->data.f[35]}; // Last scaled values for delta
   if (interpreter->Invoke() != kTfLiteOk) 
   {
-    Serial.println("Invoke failed!");
+    Serial.println("Invoke failed!"); // Check if model ran successfully
     return;
   }
 
-  // Convert output back to real values
-  // output->data.f contains deltas for next 12 readings
-
+  // Print predicted next hour
   Serial.println("Predicted next hour:");
   for(int t = 0; t < 12; t++)
   {
+    // Add predicted delta to last scaled value
     p_pred = lastScaled[0] + output->data.f[t*3 + 0];
     t_pred = lastScaled[1] + output->data.f[t*3 + 1];
     h_pred = lastScaled[2] + output->data.f[t*3 + 2];
@@ -192,8 +158,5 @@ void setup() {
   Serial.println("-------------1 hour completed------------");
 }
 
-void loop()
-{
-
-}
-
+// ------------------------- Arduino Loop ---------------------------------------------------------------------------------------------------
+void loop(){}
